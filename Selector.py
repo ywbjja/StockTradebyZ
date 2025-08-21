@@ -533,6 +533,160 @@ class BBIShortLongSelector:
         return picks
 
 
+class AbnormalB1Selector:
+    """
+    异动B1战法选股器
+    
+    基于少妇战法（BBIKDJSelector）的基础上增加异动筛选：
+    1. 20天内有异动期（连续大阳线但不涨停）
+    2. 阴线成交量小于阳线成交量
+    3. B1当天及前几天极致缩量
+    """
+    
+    def __init__(
+        self,
+        # 少妇战法基础参数
+        j_threshold: float = 10,
+        bbi_min_window: int = 20,
+        max_window: int = 60,
+        price_range_pct: float = 1,
+        bbi_q_threshold: float = 0.3,
+        j_q_threshold: float = 0.10,
+        # 异动特有参数
+        abnormal_lookback: int = 20,        # 异动回溯天数
+        min_up_days: int = 3,                # 最少连续上涨天数
+        up_threshold: float = 3.0,           # 大涨阈值（%）
+        limit_threshold: float = 9.5,        # 涨停阈值（%）
+        volume_shrink_days: int = 3,         # B1前缩量天数
+        volume_shrink_ratio: float = 0.5,    # 缩量比例
+    ) -> None:
+        self.j_threshold = j_threshold
+        self.bbi_min_window = bbi_min_window
+        self.max_window = max_window
+        self.price_range_pct = price_range_pct
+        self.bbi_q_threshold = bbi_q_threshold
+        self.j_q_threshold = j_q_threshold
+        self.abnormal_lookback = abnormal_lookback
+        self.min_up_days = min_up_days
+        self.up_threshold = up_threshold
+        self.limit_threshold = limit_threshold
+        self.volume_shrink_days = volume_shrink_days
+        self.volume_shrink_ratio = volume_shrink_ratio
+        
+        # 内部使用少妇战法选股器
+        self.bbi_selector = BBIKDJSelector(
+            j_threshold=j_threshold,
+            bbi_min_window=bbi_min_window,
+            max_window=max_window,
+            price_range_pct=price_range_pct,
+            bbi_q_threshold=bbi_q_threshold,
+            j_q_threshold=j_q_threshold,
+        )
+    
+    def _find_abnormal_period(self, hist: pd.DataFrame) -> bool:
+        """
+        在最近abnormal_lookback天内寻找异动期
+        异动期特征：
+        1. 连续多天大涨（涨幅>up_threshold%）但不涨停（涨幅<limit_threshold%）
+        2. 期间阴线成交量小于阳线成交量
+        """
+        if len(hist) < self.abnormal_lookback:
+            return False
+            
+        # 计算涨跌幅
+        hist = hist.copy()
+        hist["pct_chg"] = hist["close"].pct_change() * 100
+        hist["is_up"] = hist["pct_chg"] > 0
+        
+        # 检查最近abnormal_lookback天
+        recent = hist.tail(self.abnormal_lookback)
+        
+        # 寻找连续上涨期
+        for i in range(len(recent) - self.min_up_days + 1):
+            window = recent.iloc[i:i + self.min_up_days]
+            
+            # 检查是否连续大涨但不涨停
+            big_ups = (window["pct_chg"] >= self.up_threshold) & (window["pct_chg"] < self.limit_threshold)
+            if not big_ups.all():
+                continue
+                
+            # 检查该窗口及之后的阴阳线成交量关系
+            period = recent.iloc[i:]
+            up_days = period[period["is_up"]]
+            down_days = period[~period["is_up"]]
+            
+            if len(down_days) > 0 and len(up_days) > 0:
+                # 阴线平均成交量应小于阳线平均成交量
+                avg_down_vol = down_days["volume"].mean()
+                avg_up_vol = up_days["volume"].mean()
+                if avg_down_vol >= avg_up_vol:
+                    continue
+            
+            return True
+            
+        return False
+    
+    def _check_volume_shrink(self, hist: pd.DataFrame) -> bool:
+        """
+        检查B1当天及前几天是否极致缩量
+        """
+        if len(hist) < self.volume_shrink_days + self.abnormal_lookback:
+            return False
+            
+        # 最近volume_shrink_days天的成交量
+        recent_vols = hist.tail(self.volume_shrink_days)["volume"]
+        
+        # 计算前abnormal_lookback天的成交量统计
+        lookback_vols = hist.tail(self.abnormal_lookback)["volume"]
+        
+        # 方法1：检查是否为近期低点（在前25%分位）
+        vol_25_percentile = lookback_vols.quantile(0.25)
+        if (recent_vols <= vol_25_percentile).all():
+            return True
+            
+        # 方法2：检查是否相对异动前缩量
+        # 找异动前的平均成交量作为基准
+        pre_abnormal = hist.iloc[-(self.abnormal_lookback + 10):-self.abnormal_lookback]
+        if len(pre_abnormal) >= 5:
+            pre_avg_vol = pre_abnormal["volume"].mean()
+            current_avg_vol = recent_vols.mean()
+            if current_avg_vol <= pre_avg_vol * self.volume_shrink_ratio:
+                return True
+                
+        return False
+    
+    def _passes_filters(self, hist: pd.DataFrame) -> bool:
+        """单支股票过滤"""
+        # 首先必须满足少妇战法的基础条件
+        if not self.bbi_selector._passes_filters(hist):
+            return False
+            
+        # 检查是否有异动期
+        if not self._find_abnormal_period(hist):
+            return False
+            
+        # 检查是否极致缩量
+        if not self._check_volume_shrink(hist):
+            return False
+            
+        return True
+    
+    def select(
+        self, date: pd.Timestamp, data: Dict[str, pd.DataFrame]
+    ) -> List[str]:
+        """批量选股"""
+        picks: List[str] = []
+        for code, df in data.items():
+            hist = df[df["date"] <= date]
+            if hist.empty:
+                continue
+            # 需要足够的历史数据
+            hist = hist.tail(self.max_window + self.abnormal_lookback + 20)
+            if self._passes_filters(hist):
+                picks.append(code)
+        return picks
+
+
 class BreakoutVolumeKDJSelector:
     """
     放量突破 + KDJ + DIF>0 + 收盘价波动幅度 选股器   
